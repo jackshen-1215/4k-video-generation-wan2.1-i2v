@@ -492,8 +492,10 @@ class WanI2V:
                             y_tile_model_input = [y_tile_ring_fmt.squeeze(0).permute(1,0,2,3)]
                             
                             _tile_f, _tile_h, _tile_w = x_tile_model_input[0].shape[1], x_tile_model_input[0].shape[2], x_tile_model_input[0].shape[3]
-                            tile_seq_len = ((_tile_f - 1) // self.vae_stride[0] + 1) * _tile_h * _tile_w // \
-                                           (self.model.patch_size[1] * self.model.patch_size[2])
+                            num_temporal_patches = _tile_f // self.model.patch_size[0]
+                            num_spatial_patches = (_tile_h * _tile_w) // (self.model.patch_size[1] * self.model.patch_size[2])
+                            tile_seq_len = num_temporal_patches * num_spatial_patches
+                            
                             tile_seq_len = int(math.ceil(tile_seq_len / self.sp_size)) * self.sp_size
                             
                             arg_c_tile = {'context': context, 'clip_fea': clip_context, 'seq_len': tile_seq_len, 'y': y_tile_model_input}
