@@ -270,7 +270,7 @@ class WanI2V:
                  n_prompt="",
                  seed=-1,
                  offload_model=True,
-                 enable_tiling: bool = False,
+                 enable_tiling: bool = True,
                  tile_window_height_factor: float = 1.0,
                  tile_window_width_factor: float = 0.5,
                  tile_stride_factor: float = 0.25
@@ -302,7 +302,7 @@ class WanI2V:
                 Random seed for noise generation. If -1, use random seed
             offload_model (`bool`, *optional*, defaults to True):
                 If True, offloads models to CPU during generation to save VRAM
-            enable_tiling (`bool`, *optional*, defaults to False):
+            enable_tiling (`bool`, *optional*, defaults to True):
                 Whether to use tile-based denoising.
             tile_window_height_factor (`float`, *optional*, defaults to 1.0):
                 Tile height as a factor of the full latent height.
@@ -396,6 +396,18 @@ class WanI2V:
         self.clip.model.to(self.device)
         clip_context = self.clip.visual([img_tensor_for_clip_vae[:, None, :, :]])
         if offload_model: self.clip.model.cpu()
+
+        # Determine k_text_fg_indices and k_text_bg_indices (once per prompt)
+        # For now, let's assume all text tokens from 'context' are foreground
+        # and no specific background text tokens for tile background patches to attend to.
+        k_text_fg_indices = None
+        k_text_bg_indices = None
+        if context is not None and len(context) > 0 and context[0] is not None:
+            # Assuming context is a list, and each element is [1, seq_len, dim] or similar
+            # Taking seq_len from the first item in the list (e.g., text embedding)
+            text_seq_len = context[0].shape[1]
+            k_text_fg_indices = torch.arange(text_seq_len, device=self.device, dtype=torch.long)
+            k_text_bg_indices = torch.empty(0, device=self.device, dtype=torch.long) # No specific background text tokens
 
         vae_input_img_part = torch.nn.functional.interpolate(
             img_tensor_for_clip_vae[None], size=(h_target_render, w_target_render), mode='bicubic'
@@ -493,17 +505,59 @@ class WanI2V:
                             
                             _tile_f, _tile_h, _tile_w = x_tile_model_input[0].shape[1], x_tile_model_input[0].shape[2], x_tile_model_input[0].shape[3]
                             num_temporal_patches = _tile_f // self.model.patch_size[0]
-                            num_spatial_patches = (_tile_h * _tile_w) // (self.model.patch_size[1] * self.model.patch_size[2])
-                            tile_seq_len = num_temporal_patches * num_spatial_patches
+                            num_spatial_patches_h = _tile_h // self.model.patch_size[1]
+                            num_spatial_patches_w = _tile_w // self.model.patch_size[2]
                             
+                            # Create q_tile_spatial_fg_mask for the current tile
+                            # Defines foreground region within the tile (e.g., center 50%)
+                            # Mask shape should be (num_spatial_patches_h * num_spatial_patches_w)
+                            q_tile_spatial_fg_mask = torch.zeros(num_spatial_patches_h, num_spatial_patches_w, dtype=torch.bool, device=self.device)
+                            
+                            center_h_ratio = 0.5 
+                            center_w_ratio = 0.5
+                            
+                            h_center_start = int(num_spatial_patches_h * (0.5 - center_h_ratio / 2))
+                            h_center_end = int(num_spatial_patches_h * (0.5 + center_h_ratio / 2))
+                            w_center_start = int(num_spatial_patches_w * (0.5 - center_w_ratio / 2))
+                            w_center_end = int(num_spatial_patches_w * (0.5 + center_w_ratio / 2))
+                            
+                            if h_center_end > h_center_start and w_center_end > w_center_start:
+                                q_tile_spatial_fg_mask[h_center_start:h_center_end, w_center_start:w_center_end] = True
+                            q_tile_spatial_fg_mask = q_tile_spatial_fg_mask.flatten() # Shape: (num_spatial_patches_h * num_spatial_patches_w)
+
+
+                            tile_seq_len = num_temporal_patches * num_spatial_patches_h * num_spatial_patches_w
                             tile_seq_len = int(math.ceil(tile_seq_len / self.sp_size)) * self.sp_size
                             
-                            arg_c_tile = {'context': context, 'clip_fea': clip_context, 'seq_len': tile_seq_len, 'y': y_tile_model_input}
-                            noise_pred_cond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **arg_c_tile)[0]
+                            model_kwargs_tile = {
+                                'context': context, 
+                                'clip_fea': clip_context, 
+                                'seq_len': tile_seq_len, 
+                                'y': y_tile_model_input,
+                                'enable_tiling_mask': True,
+                                'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
+                                'k_text_fg_indices': k_text_fg_indices,
+                                'k_text_bg_indices': k_text_bg_indices,
+                            }
+                            
+                            noise_pred_cond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **model_kwargs_tile)[0]
                             if offload_model: torch.cuda.empty_cache()
 
-                            arg_null_tile = {'context': context_null, 'clip_fea': clip_context, 'seq_len': tile_seq_len, 'y': y_tile_model_input}
-                            noise_pred_uncond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **arg_null_tile)[0]
+                            # For null condition, we might not need the nuanced mask, or pass None for text indices.
+                            # For simplicity, let's pass the same kwargs, assuming an advanced attention module
+                            # might internally handle None for fg/bg indices if context is null.
+                            # Or, ideally, the attention module checks if context is the null context and skips this masking.
+                            model_kwargs_null_tile = {
+                                'context': context_null, 
+                                'clip_fea': clip_context, 
+                                'seq_len': tile_seq_len, 
+                                'y': y_tile_model_input,
+                                'enable_tiling_mask': True, # Keep structure, actual masking might be skipped if context_null implies no text
+                                'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
+                                'k_text_fg_indices': k_text_fg_indices, # Or pass None if context_null means "no text"
+                                'k_text_bg_indices': k_text_bg_indices, # Or pass None
+                            }
+                            noise_pred_uncond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **model_kwargs_null_tile)[0]
                             if offload_model: torch.cuda.empty_cache()
                             
                             final_noise_pred_tile = noise_pred_uncond_tile + guide_scale * (noise_pred_cond_tile - noise_pred_uncond_tile)
@@ -550,12 +604,26 @@ class WanI2V:
                     model_input_x_list = [latent_xt] 
                     model_input_y_list = [y_condition]
 
-                    arg_c = {'context': context, 'clip_fea': clip_context, 'seq_len': full_max_seq_len, 'y': model_input_y_list}
-                    noise_pred_cond = self.model(model_input_x_list, t=current_timestep_tensor, **arg_c)[0]
+                    # When not tiling, disable the tiling mask logic
+                    model_kwargs_full = {
+                        'context': context, 
+                        'clip_fea': clip_context, 
+                        'seq_len': full_max_seq_len, 
+                        'y': model_input_y_list,
+                        'enable_tiling_mask': False, # Explicitly False
+                        # The other mask-related params are not needed when enable_tiling_mask is False
+                    }
+                    noise_pred_cond = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_full)[0]
                     if offload_model: torch.cuda.empty_cache()
 
-                    arg_null = {'context': context_null, 'clip_fea': clip_context, 'seq_len': full_max_seq_len, 'y': model_input_y_list}
-                    noise_pred_uncond = self.model(model_input_x_list, t=current_timestep_tensor, **arg_null)[0]
+                    model_kwargs_null_full = {
+                        'context': context_null, 
+                        'clip_fea': clip_context, 
+                        'seq_len': full_max_seq_len, 
+                        'y': model_input_y_list,
+                        'enable_tiling_mask': False,
+                    }
+                    noise_pred_uncond = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_null_full)[0]
                     if offload_model: torch.cuda.empty_cache()
                     
                     noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)

@@ -24,7 +24,17 @@ cd Wan2.1
 cp ./image2video_tilescale.py ./wan/image2video.py
 ```
 
-### 4. Run the Video Generation
+### 4. Move the Provided Model, Attention
+
+Move the provided `model_tilescale.py` and `attention_tilescale.py` into the modules directory, replacing the existing file:
+
+```bash
+cd Wan2.1
+cp ./model_tilescale.py ./wan/modules/model.py
+cp ./attention_tilescale.py ./wan/modules/attention.py
+```
+
+### 5. Run the Video Generation
 
 Use the standard scripts for video generation as described in the official repository.  
 Ensure you specify the appropriate parameters for 4K output.
