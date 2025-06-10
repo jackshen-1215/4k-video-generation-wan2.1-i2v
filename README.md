@@ -24,14 +24,15 @@ cd Wan2.1
 cp ./image2video_tilescale.py ./wan/image2video.py
 ```
 
-### 4. Move the Provided Model, Attention
+### 4. Move the Provided Model, Attention, Generate Files
 
-Move the provided `model_tilescale.py` and `attention_tilescale.py` into the modules directory, replacing the existing file:
+Move the provided files into the corresponding directory, replacing the existing file:
 
 ```bash
 cd Wan2.1
 cp ./model_tilescale.py ./wan/modules/model.py
 cp ./attention_tilescale.py ./wan/modules/attention.py
+cp ./generate_low-res-guide/py ./generate.py
 ```
 
 ### 5. Run the Video Generation

@@ -233,7 +233,6 @@ class WanI2VCrossAttention(WanSelfAttention):
                   q_tile_spatial_fg_mask: torch.Tensor | None = None,
                   k_text_fg_indices: torch.Tensor | None = None, # These are for the text part of context
                   k_text_bg_indices: torch.Tensor | None = None, # These are for the text part of context
-                  # allowed_k_indices: torch.Tensor | None = None, # Can be defined per call if needed
                   ):
         r"""
         Args:
@@ -367,7 +366,8 @@ class WanAttentionBlock(nn.Module):
             grid_sizes,
             freqs,
             enable_tiling_mask=enable_tiling_mask,
-            q_tile_spatial_fg_mask=q_tile_spatial_fg_mask)
+            q_tile_spatial_fg_mask=q_tile_spatial_fg_mask,
+            )
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 

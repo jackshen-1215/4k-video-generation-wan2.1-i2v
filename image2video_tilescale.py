@@ -29,7 +29,13 @@ from .utils.fm_solvers import (
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 
-def get_dimension_slices_and_sizes(begin, end, size):
+def get_dimension_slices_and_sizes(begin, end, size, wrap=True):
+    if not wrap:
+        begin_clamped = max(0, begin)
+        end_clamped = min(size, end)
+        if begin_clamped >= end_clamped:
+            return [], []
+        return [slice(begin_clamped, end_clamped)], [end_clamped - begin_clamped]
 
     slices = []
     sizes = [] 
@@ -57,8 +63,9 @@ def get_dimension_slices_and_sizes(begin, end, size):
         
             
 class RingLatent2D:
-    def __init__(self, latent_tensor):
+    def __init__(self, latent_tensor, wrap=True):
         self.torch_latent = latent_tensor.clone()
+        self.wrap = wrap
         self.batch_size = self.torch_latent.shape[0] 
         self.num_frames = self.torch_latent.shape[1]
         self.channels = self.torch_latent.shape[2]
@@ -79,11 +86,12 @@ class RingLatent2D:
             right = self.width
             
         # Ensure the indices are within the valid range
-        assert 0 <= top < bottom <= self.height * 2, f"Invalid top {top} and bottom {bottom}"
-        assert 0 <= left < right <= self.width * 2, f"Invalid left {left} and right {right}"
+        if self.wrap:
+            assert 0 <= top < bottom <= self.height * 2, f"Invalid top {top} and bottom {bottom}"
+            assert 0 <= left < right <= self.width * 2, f"Invalid left {left} and right {right}"
         
-        height_slices, height_sizes = get_dimension_slices_and_sizes(top, bottom, self.height)
-        width_slices, width_sizes = get_dimension_slices_and_sizes(left, right, self.width)
+        height_slices, height_sizes = get_dimension_slices_and_sizes(top, bottom, self.height, self.wrap)
+        width_slices, width_sizes = get_dimension_slices_and_sizes(left, right, self.width, self.wrap)
 
         # Get the parts of the latent tensor
         parts = []
@@ -121,8 +129,8 @@ class RingLatent2D:
         target_height = bottom - top if bottom <= self.height else (self.height - top) + (bottom % self.height)
         target_width = right - left if right <= self.width else (self.width - left) + (right % self.width)
 
-        width_slices, width_sizes = get_dimension_slices_and_sizes(left, right, self.width)
-        height_slices, height_sizes = get_dimension_slices_and_sizes(top, bottom, self.height)
+        width_slices, width_sizes = get_dimension_slices_and_sizes(left, right, self.width, self.wrap)
+        height_slices, height_sizes = get_dimension_slices_and_sizes(top, bottom, self.height, self.wrap)
 
         target_height = sum(height_sizes)
         target_width = sum(width_sizes)
@@ -258,6 +266,189 @@ class WanI2V:
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
+    def _generate_coarse_video(self,
+                 input_prompt,
+                 img,
+                 max_area=720 * 1280,
+                 frame_num=81,
+                 shift=5.0,
+                 sample_solver='unipc',
+                 sampling_steps=40,
+                 guide_scale=5.0,
+                 n_prompt="",
+                 seed=-1,
+                 offload_model=True):
+        img_tensor = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
+
+        F = frame_num
+        h_img, w_img = img_tensor.shape[1:]
+        aspect_ratio = h_img / w_img
+        lat_h = round(
+            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+            self.patch_size[1] * self.patch_size[1])
+        lat_w = round(
+            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+            self.patch_size[2] * self.patch_size[2])
+        h = lat_h * self.vae_stride[1]
+        w = lat_w * self.vae_stride[2]
+
+        max_seq_len = ((F - 1) // self.vae_stride[0] + 1) * lat_h * lat_w // (
+            self.patch_size[1] * self.patch_size[2])
+        max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+
+        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
+        seed_g = torch.Generator(device=self.device)
+        seed_g.manual_seed(seed)
+        noise = torch.randn(
+            16, (F - 1) // 4 + 1,
+            lat_h,
+            lat_w,
+            dtype=torch.float32,
+            generator=seed_g,
+            device=self.device)
+
+        F_model_sched = (F - 1) // self.config.vae_stride[0] + 1
+        
+        C_mask = 4
+        msk_cond = torch.ones(1, 1, lat_h, lat_w, device=self.device)
+        if F_model_sched > 1:
+            msk_zeros = torch.zeros(1, F_model_sched - 1, lat_h, lat_w, device=self.device)
+            msk_cond_frames = torch.cat([msk_cond, msk_zeros], dim=1)
+        else:
+            msk_cond_frames = msk_cond
+
+        if n_prompt == "":
+            n_prompt = self.sample_neg_prompt
+
+        if not self.t5_cpu:
+            self.text_encoder.model.to(self.device)
+            context = self.text_encoder([input_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device)
+            if offload_model:
+                self.text_encoder.model.cpu()
+        else:
+            context = self.text_encoder([input_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context = [t.to(self.device) for t in context]
+            context_null = [t.to(self.device) for t in context_null]
+
+        self.clip.model.to(self.device)
+        clip_context = self.clip.visual([img_tensor[:, None, :, :]])
+        if offload_model:
+            self.clip.model.cpu()
+
+        vae_input_img_part = torch.nn.functional.interpolate(
+            img_tensor[None], size=(h, w), mode='bicubic'
+        ).squeeze(0)
+
+        if F > 1:
+            vae_input_zeros_part = torch.zeros(vae_input_img_part.shape[0], F - 1, h, w,
+                                                dtype=vae_input_img_part.dtype, device=self.device)
+            vae_input_full = torch.cat([vae_input_img_part.unsqueeze(1), vae_input_zeros_part], dim=1)
+        else:
+            vae_input_full = vae_input_img_part.unsqueeze(1)
+        
+        y = self.vae.encode([vae_input_full])[0]
+        
+        msk_final_channels = 4
+        msk_y_cond_part = torch.zeros(msk_final_channels, F_model_sched, lat_h, lat_w, device=self.device)
+        if F_model_sched > 0:
+            msk_y_cond_part[:, 0, :, :] = 1
+        
+        y_condition = torch.cat([msk_y_cond_part, y])
+
+        @contextmanager
+        def noop_no_sync():
+            yield
+
+        no_sync = getattr(self.model, 'no_sync', noop_no_sync)
+
+        with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+
+            if sample_solver == 'unipc':
+                sample_scheduler = FlowUniPCMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sample_scheduler.set_timesteps(
+                    sampling_steps, device=self.device, shift=shift)
+                timesteps = sample_scheduler.timesteps
+            elif sample_solver == 'dpm++':
+                sample_scheduler = FlowDPMSolverMultistepScheduler(
+                    num_train_timesteps=self.num_train_timesteps,
+                    shift=1,
+                    use_dynamic_shifting=False)
+                sampling_sigmas = get_sampling_sigmas(sampling_steps, shift)
+                timesteps, _ = retrieve_timesteps(
+                    sample_scheduler,
+                    device=self.device,
+                    sigmas=sampling_sigmas)
+            else:
+                raise NotImplementedError("Unsupported solver.")
+            
+            latent = noise
+            denoised_x0 = None
+            
+            arg_c = {
+                'context': context,
+                'clip_fea': clip_context,
+                'seq_len': max_seq_len,
+                'y': [y_condition],
+            }
+
+            arg_null = {
+                'context': context_null,
+                'clip_fea': clip_context,
+                'seq_len': max_seq_len,
+                'y': [y_condition],
+            }
+
+            if offload_model:
+                torch.cuda.empty_cache()
+
+            self.model.to(self.device)
+            for i_step, t in enumerate(tqdm(timesteps)):
+                latent_model_input = [latent.to(self.device)]
+                timestep = torch.tensor([t], device=self.device)
+
+                noise_pred_cond = self.model(
+                    latent_model_input, t=timestep, **arg_c)[0]
+                if offload_model:
+                    torch.cuda.empty_cache()
+                noise_pred_uncond = self.model(
+                    latent_model_input, t=timestep, **arg_null)[0]
+                if offload_model:
+                    torch.cuda.empty_cache()
+                
+                noise_pred = noise_pred_uncond + guide_scale * (
+                    noise_pred_cond - noise_pred_uncond)
+
+                step_output = sample_scheduler.step(
+                    noise_pred,
+                    t,
+                    latent,
+                    return_dict=True,
+                    generator=seed_g)
+                
+                latent = step_output.prev_sample
+                if hasattr(step_output, 'pred_original_sample'):
+                    denoised_x0 = step_output.pred_original_sample
+
+            if offload_model:
+                self.model.cpu()
+                torch.cuda.empty_cache()
+            
+            videos = self.vae.decode([denoised_x0 if denoised_x0 is not None else latent])
+
+        del noise, latent, y_condition, context, context_null, clip_context, sample_scheduler
+        if offload_model:
+            gc.collect()
+            torch.cuda.synchronize()
+        if dist.is_initialized():
+            dist.barrier()
+        
+        return videos[0] if self.rank == 0 else None
+
     def generate(self,
                  input_prompt,
                  img,
@@ -273,7 +464,11 @@ class WanI2V:
                  enable_tiling: bool = True,
                  tile_window_height_factor: float = 1.0,
                  tile_window_width_factor: float = 0.5,
-                 tile_stride_factor: float = 0.25
+                 tile_stride_factor: float = 0.25,
+                 use_coarse_to_fine: bool = True,
+                 coarse_max_area_factor: float = 0.25,
+                 guidance_scale_schedule: tuple = (0.7, 0.2),
+                 is_panorama: bool = False,
                 ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -311,6 +506,15 @@ class WanI2V:
             tile_stride_factor (`float`, *optional*, defaults to 0.25):
                 Stride for sliding window as a factor of the tile window dimension.
                 A lower value means more overlap and more tiles.
+            use_coarse_to_fine (`bool`, *optional*, defaults to False):
+                Enable two-stage generation where a low-res video guides a high-res one.
+            coarse_max_area_factor (`float`, *optional*, defaults to 0.25):
+                The factor to reduce `max_area` by for the initial coarse video generation.
+            guidance_scale_schedule (`tuple`, *optional*, defaults to (0.7, 0.2)):
+                The schedule for mixing the guidance latent. `(start_mix_factor, end_mix_factor)`.
+                A higher value means more of the guidance latent is mixed in.
+            is_panorama (`bool`, *optional*, defaults to False):
+                Whether the generation is for a 360-degree panoramic video. Affects tiling logic.
 
         Returns:
             torch.Tensor:
@@ -320,6 +524,60 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+        low_res_video_to_return = None
+        if use_coarse_to_fine:
+            print("--- Coarse-to-Fine Generation Stage 1: Generating low-resolution video ---")
+            
+            low_res_video = self._generate_coarse_video(
+                input_prompt=input_prompt,
+                img=img,
+                max_area=int(max_area * coarse_max_area_factor),
+                frame_num=frame_num,
+                shift=shift / 2.0,
+                sample_solver=sample_solver,
+                sampling_steps=sampling_steps,
+                guide_scale=guide_scale,
+                n_prompt=n_prompt,
+                seed=seed,
+                offload_model=offload_model
+            )
+            low_res_video_to_return = low_res_video
+            
+            print("--- Coarse-to-Fine Generation Stage 2: Preparing for high-resolution generation ---")
+
+            h_img_for_size, w_img_for_size = TF.to_tensor(img).shape[1:]
+            aspect_ratio_for_size = h_img_for_size / w_img_for_size
+            lat_h_hr = round(
+                np.sqrt(max_area * aspect_ratio_for_size) / self.vae_stride[1] /
+                self.patch_size[1] * self.patch_size[1])
+            lat_w_hr = round(
+                np.sqrt(max_area / aspect_ratio_for_size) / self.vae_stride[2] /
+                self.patch_size[2] * self.patch_size[2])
+
+            print(f"Encoding and upscaling low-resolution video latent to {lat_h_hr}x{lat_w_hr} for guidance...")
+            
+            # VAE expects a list of videos, where each is [C, F, H, W].
+            low_res_latent_list = self.vae.encode([low_res_video.to(self.device)])
+            if low_res_latent_list:
+                 low_res_latent = low_res_latent_list[0]
+                 
+                 # Reshape for bicubic interpolation, which works spatially.
+                 # (C, F, H, W) -> (F, C, H, W)
+                 low_res_latent_f_batch = low_res_latent.permute(1, 0, 2, 3)
+                 
+                 # Upscale the latent to the high-resolution target dimensions.
+                 guidance_latent_hr_f_batch = torch.nn.functional.interpolate(
+                     low_res_latent_f_batch,
+                     size=(lat_h_hr, lat_w_hr),
+                     mode='bicubic',
+                     align_corners=False
+                 )
+                 guidance_latent_hr = guidance_latent_hr_f_batch.permute(1, 0, 2, 3) # (C, F, H_hr, W_hr)
+            else:
+                guidance_latent_hr = None
+        else:
+            guidance_latent_hr = None
+
         img_tensor_for_clip_vae = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
@@ -327,10 +585,10 @@ class WanI2V:
         aspect_ratio = h_img / w_img
 
         lat_h = round(
-            np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
+            np.sqrt(max_area * aspect_ratio) / self.vae_stride[1] /
             self.patch_size[1] * self.patch_size[1])
         lat_w = round(
-            np.sqrt(max_area / aspect_ratio) // self.vae_stride[2] //
+            np.sqrt(max_area / aspect_ratio) / self.vae_stride[2] /
             self.patch_size[2] * self.patch_size[2])
         
         h_target_render = lat_h * self.vae_stride[1]
@@ -409,6 +667,8 @@ class WanI2V:
             k_text_fg_indices = torch.arange(text_seq_len, device=self.device, dtype=torch.long)
             k_text_bg_indices = torch.empty(0, device=self.device, dtype=torch.long) # No specific background text tokens
 
+        # The y_condition should always be based on the initial input image to provide a consistent
+        # starting point for style, even when using coarse-to-fine guidance for motion.
         vae_input_img_part = torch.nn.functional.interpolate(
             img_tensor_for_clip_vae[None], size=(h_target_render, w_target_render), mode='bicubic'
         ).squeeze(0)
@@ -419,8 +679,10 @@ class WanI2V:
             vae_input_full = torch.cat([vae_input_img_part.unsqueeze(1), vae_input_zeros_part], dim=1)
         else:
             vae_input_full = vae_input_img_part.unsqueeze(1)
-        
-        vae_y_encoded = self.vae.encode([vae_input_full.to(self.device)])[0]
+
+        vae_y_encoded_list = self.vae.encode([vae_input_full.to(self.device)])
+        vae_y_encoded = vae_y_encoded_list[0] if vae_y_encoded_list else torch.zeros(C_noise, F_model_sched, lat_h, lat_w, device=self.device)
+
 
         y_condition = torch.cat([msk_y_cond_part, vae_y_encoded], dim=0)
 
@@ -444,13 +706,13 @@ class WanI2V:
 
             if enable_tiling:
                 latent_xt_for_ring = noise.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                ring_latent_handler = RingLatent2D(latent_xt_for_ring)
+                ring_latent_handler = RingLatent2D(latent_xt_for_ring, wrap=is_panorama)
 
                 y_condition_for_ring = y_condition.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                ring_y_condition_handler = RingLatent2D(y_condition_for_ring)
+                ring_y_condition_handler = RingLatent2D(y_condition_for_ring, wrap=is_panorama)
                 
-                aggregated_noise_pred_handler = RingLatent2D(torch.zeros_like(latent_xt_for_ring, device=self.device))
-                noise_contribution_counts = RingLatent2D(torch.zeros_like(latent_xt_for_ring, dtype=torch.int, device=self.device))
+                aggregated_noise_pred_handler = RingLatent2D(torch.zeros_like(latent_xt_for_ring, device=self.device), wrap=is_panorama)
+                noise_contribution_counts = RingLatent2D(torch.zeros_like(latent_xt_for_ring, dtype=torch.int, device=self.device), wrap=is_panorama)
 
                 patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
 
@@ -464,13 +726,16 @@ class WanI2V:
                 num_windows_h = math.ceil(lat_h / window_h_tile)
                 num_windows_w = math.ceil(lat_w / window_w_tile)
 
-                stride_h_tile = max(1, int(window_h_tile * tile_stride_factor))
-                stride_w_tile = max(1, int(window_w_tile * tile_stride_factor))
+                stride_h_tile = (max(1, int(window_h_tile * tile_stride_factor)) // patch_h_model) * patch_h_model
+                stride_w_tile = (max(1, int(window_w_tile * tile_stride_factor)) // patch_w_model) * patch_w_model
                 
                 num_offset_steps = max(1, int(1 / tile_stride_factor))
             
             else:
                 latent_xt = noise.to(self.device) 
+                denoised_x0 = None
+
+            final_denoised_handler = RingLatent2D(torch.zeros_like(noise.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)), wrap=is_panorama) if enable_tiling else None
 
             if offload_model: torch.cuda.empty_cache()
             self.model.to(self.device)
@@ -478,21 +743,55 @@ class WanI2V:
             for i_step, t_val in enumerate(tqdm(timesteps)):
                 current_timestep_tensor = torch.tensor([t_val], device=self.device)
 
+                if use_coarse_to_fine and guidance_latent_hr is not None:
+                    if sample_solver == 'dpm++':
+                        sigma = t_val
+                    elif sample_solver == 'unipc':
+                        # For unipc, the i-th sigma in the schedule corresponds to the i-th timestep.
+                        sigma = sample_scheduler.sigmas[i_step]
+                    else:
+                        # Fallback or error for other solvers if they are added in the future
+                        raise NotImplementedError(f"Sigma calculation for solver {sample_solver} is not implemented.")
+
+                    # Implement latent mixing guidance
+                    progress = i_step / len(timesteps)
+                    start_mix, end_mix = guidance_scale_schedule
+                    # Linearly interpolate the mixing factor
+                    mix_factor = start_mix + (end_mix - start_mix) * progress
+
+                    if not enable_tiling:
+                        current_latent_target = latent_xt
+                    else:
+                        current_latent_target = ring_latent_handler.torch_latent.squeeze(0).permute(1,0,2,3)
+                    
+                    noise_for_guidance = torch.randn(guidance_latent_hr.shape, generator=seed_g, device=self.device, dtype=guidance_latent_hr.dtype)
+                    noised_guidance_latent = guidance_latent_hr + sigma * noise_for_guidance
+
+                    mixed_latent = torch.lerp(current_latent_target, noised_guidance_latent, mix_factor)
+
+                    if not enable_tiling:
+                        latent_xt = mixed_latent
+                    else:
+                        ring_latent_handler.torch_latent = mixed_latent.permute(1, 0, 2, 3).unsqueeze(0)
+
+
                 if enable_tiling:
                     current_full_latents_xt_ring = ring_latent_handler.torch_latent.clone()
-                    aggregated_noise_pred_handler.torch_latent.zero_()
-                    noise_contribution_counts.torch_latent.zero_()
                     
                     offset_idx = i_step % num_offset_steps
                     current_offset_h = offset_idx * (stride_h_tile // num_offset_steps) if num_offset_steps > 0 else 0
                     current_offset_w = offset_idx * (stride_w_tile // num_offset_steps) if num_offset_steps > 0 else 0
 
-                    for h_start_base in range(0, lat_h - window_h_tile + 1, stride_h_tile):
-                        for w_start_base in range(0, lat_w - window_w_tile + 1, stride_w_tile):
+                    for h_start_base in range(0, lat_h, stride_h_tile):
+                        for w_start_base in range(0, lat_w, stride_w_tile):
                             tile_top = (h_start_base + current_offset_h)
                             tile_bottom = tile_top + window_h_tile
                             tile_left = (w_start_base + current_offset_w)
                             tile_right = tile_left + window_w_tile
+
+                            if not is_panorama:
+                                if tile_left >= lat_w or tile_top >= lat_h:
+                                    continue
 
                             x_tile_ring_fmt = ring_latent_handler.get_window_latent(tile_top, tile_bottom, tile_left, tile_right)
                             
@@ -503,28 +802,29 @@ class WanI2V:
                             x_tile_model_input = [x_tile_ring_fmt.squeeze(0).permute(1,0,2,3)]
                             y_tile_model_input = [y_tile_ring_fmt.squeeze(0).permute(1,0,2,3)]
                             
-                            _tile_f, _tile_h, _tile_w = x_tile_model_input[0].shape[1], x_tile_model_input[0].shape[2], x_tile_model_input[0].shape[3]
+                            # Pad the input tile if its dimensions are not divisible by the patch size
+                            patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
+                            h_orig, w_orig = x_tile_model_input[0].shape[-2:]
+                            h_pad = (patch_h_model - h_orig % patch_h_model) % patch_h_model
+                            w_pad = (patch_w_model - w_orig % patch_w_model) % patch_w_model
+                            
+                            x_tile_for_model = x_tile_model_input[0]
+                            y_tile_for_model = y_tile_model_input[0]
+
+                            if h_pad > 0 or w_pad > 0:
+                                x_tile_for_model = torch.nn.functional.pad(x_tile_for_model, (0, w_pad, 0, h_pad), mode='replicate')
+                                y_tile_for_model = torch.nn.functional.pad(y_tile_for_model, (0, w_pad, 0, h_pad), mode='replicate')
+
+                            _tile_f, _tile_h, _tile_w = x_tile_for_model.shape[1], x_tile_for_model.shape[2], x_tile_for_model.shape[3]
                             num_temporal_patches = _tile_f // self.model.patch_size[0]
                             num_spatial_patches_h = _tile_h // self.model.patch_size[1]
                             num_spatial_patches_w = _tile_w // self.model.patch_size[2]
                             
                             # Create q_tile_spatial_fg_mask for the current tile
-                            # Defines foreground region within the tile (e.g., center 50%)
-                            # Mask shape should be (num_spatial_patches_h * num_spatial_patches_w)
-                            q_tile_spatial_fg_mask = torch.zeros(num_spatial_patches_h, num_spatial_patches_w, dtype=torch.bool, device=self.device)
-                            
-                            center_h_ratio = 0.5 
-                            center_w_ratio = 0.5
-                            
-                            h_center_start = int(num_spatial_patches_h * (0.5 - center_h_ratio / 2))
-                            h_center_end = int(num_spatial_patches_h * (0.5 + center_h_ratio / 2))
-                            w_center_start = int(num_spatial_patches_w * (0.5 - center_w_ratio / 2))
-                            w_center_end = int(num_spatial_patches_w * (0.5 + center_w_ratio / 2))
-                            
-                            if h_center_end > h_center_start and w_center_end > w_center_start:
-                                q_tile_spatial_fg_mask[h_center_start:h_center_end, w_center_start:w_center_end] = True
+                            # Defines foreground region within the tile.
+                            # Set all patches to foreground for this approach.
+                            q_tile_spatial_fg_mask = torch.ones(num_spatial_patches_h, num_spatial_patches_w, dtype=torch.bool, device=self.device)
                             q_tile_spatial_fg_mask = q_tile_spatial_fg_mask.flatten() # Shape: (num_spatial_patches_h * num_spatial_patches_w)
-
 
                             tile_seq_len = num_temporal_patches * num_spatial_patches_h * num_spatial_patches_w
                             tile_seq_len = int(math.ceil(tile_seq_len / self.sp_size)) * self.sp_size
@@ -533,14 +833,14 @@ class WanI2V:
                                 'context': context, 
                                 'clip_fea': clip_context, 
                                 'seq_len': tile_seq_len, 
-                                'y': y_tile_model_input,
+                                'y': [y_tile_for_model],
                                 'enable_tiling_mask': True,
                                 'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
                                 'k_text_fg_indices': k_text_fg_indices,
                                 'k_text_bg_indices': k_text_bg_indices,
                             }
                             
-                            noise_pred_cond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **model_kwargs_tile)[0]
+                            noise_pred_cond_tile_padded = self.model([x_tile_for_model], t=current_timestep_tensor, **model_kwargs_tile)[0]
                             if offload_model: torch.cuda.empty_cache()
 
                             # For null condition, we might not need the nuanced mask, or pass None for text indices.
@@ -551,38 +851,48 @@ class WanI2V:
                                 'context': context_null, 
                                 'clip_fea': clip_context, 
                                 'seq_len': tile_seq_len, 
-                                'y': y_tile_model_input,
+                                'y': [y_tile_for_model],
                                 'enable_tiling_mask': True, # Keep structure, actual masking might be skipped if context_null implies no text
                                 'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
                                 'k_text_fg_indices': k_text_fg_indices, # Or pass None if context_null means "no text"
                                 'k_text_bg_indices': k_text_bg_indices, # Or pass None
                             }
-                            noise_pred_uncond_tile = self.model(x_tile_model_input, t=current_timestep_tensor, **model_kwargs_null_tile)[0]
+                            noise_pred_uncond_tile_padded = self.model([x_tile_for_model], t=current_timestep_tensor, **model_kwargs_null_tile)[0]
                             if offload_model: torch.cuda.empty_cache()
+                            
+                            if h_pad > 0 or w_pad > 0:
+                                noise_pred_cond_tile = noise_pred_cond_tile_padded[..., :h_orig, :w_orig]
+                                noise_pred_uncond_tile = noise_pred_uncond_tile_padded[..., :h_orig, :w_orig]
+                            else:
+                                noise_pred_cond_tile = noise_pred_cond_tile_padded
+                                noise_pred_uncond_tile = noise_pred_uncond_tile_padded
                             
                             final_noise_pred_tile = noise_pred_uncond_tile + guide_scale * (noise_pred_cond_tile - noise_pred_uncond_tile)
                             
                             final_noise_pred_tile_ring_fmt = final_noise_pred_tile.permute(1,0,2,3).unsqueeze(0)
 
-                            h_slices_agg, _ = get_dimension_slices_and_sizes(tile_top, tile_bottom, lat_h)
-                            w_slices_agg, _ = get_dimension_slices_and_sizes(tile_left, tile_right, lat_w)
-                            
-                            h_offset_in_tile_pred = 0
-                            for hs_a_idx, hs_a_target_slice in enumerate(h_slices_agg):
-                                w_offset_in_tile_pred = 0
-                                current_tile_pred_h_size = final_noise_pred_tile_ring_fmt.shape[3]
-                                hs_v_source_slice = slice(h_offset_in_tile_pred, h_offset_in_tile_pred + (hs_a_target_slice.stop - hs_a_target_slice.start))
+                            # Aggregate the noise predictions
+                            if is_panorama:
+                                h_slices_agg, h_sizes_agg = get_dimension_slices_and_sizes(tile_top, tile_bottom, lat_h, is_panorama)
+                                w_slices_agg, w_sizes_agg = get_dimension_slices_and_sizes(tile_left, tile_right, lat_w, is_panorama)
 
-                                for ws_a_idx, ws_a_target_slice in enumerate(w_slices_agg):
-                                    ws_v_source_slice = slice(w_offset_in_tile_pred, w_offset_in_tile_pred + (ws_a_target_slice.stop - ws_a_target_slice.start))
-                                    
-                                    aggregated_noise_pred_handler.torch_latent[:, :, :, hs_a_target_slice, ws_a_target_slice] += \
-                                        final_noise_pred_tile_ring_fmt[:, :, :, hs_v_source_slice, ws_v_source_slice]
-                                    noise_contribution_counts.torch_latent[:, :, :, hs_a_target_slice, ws_a_target_slice] += 1
-                                    
-                                    w_offset_in_tile_pred += (ws_a_target_slice.stop - ws_a_target_slice.start)
-                                h_offset_in_tile_pred += (hs_a_target_slice.stop - hs_a_target_slice.start)
+                                h_offset_in_tile_pred = 0
+                                for h_slice, h_size in zip(h_slices_agg, h_sizes_agg):
+                                    w_offset_in_tile_pred = 0
+                                    for w_slice, w_size in zip(w_slices_agg, w_sizes_agg):
+                                        source_part = final_noise_pred_tile_ring_fmt[:, :, :, h_offset_in_tile_pred:h_offset_in_tile_pred + h_size, w_offset_in_tile_pred:w_offset_in_tile_pred + w_size]
+                                        aggregated_noise_pred_handler.torch_latent[:, :, :, h_slice, w_slice] += source_part
+                                        noise_contribution_counts.torch_latent[:, :, :, h_slice, w_slice] += 1
+                                        w_offset_in_tile_pred += w_size
+                                    h_offset_in_tile_pred += h_size
+                            else:
+                                # Simplified logic for non-panoramic videos
+                                h_slice = slice(max(0, tile_top), min(lat_h, tile_bottom))
+                                w_slice = slice(max(0, tile_left), min(lat_w, tile_right))
+                                aggregated_noise_pred_handler.torch_latent[:, :, :, h_slice, w_slice] += final_noise_pred_tile_ring_fmt
+                                noise_contribution_counts.torch_latent[:, :, :, h_slice, w_slice] += 1
                     
+                    # Average the aggregated noise predictions
                     valid_counts = noise_contribution_counts.torch_latent.float().clamp(min=1.0)
                     avg_full_noise_pred_ring_fmt = aggregated_noise_pred_handler.torch_latent / valid_counts
                     
@@ -590,15 +900,22 @@ class WanI2V:
                     
                     current_full_latents_xt_model_fmt = current_full_latents_xt_ring.squeeze(0).permute(1,0,2,3)
 
-                    denoised_xt_model_fmt = sample_scheduler.step(
+                    # Perform the solver step on the full latent
+                    step_output = sample_scheduler.step(
                         avg_full_noise_pred_model_fmt,
                         t_val,
                         current_full_latents_xt_model_fmt,
-                        return_dict=False,
+                        return_dict=True,
                         generator=seed_g 
-                    )[0]
+                    )
+                    denoised_xt_model_fmt = step_output.prev_sample
                     
                     ring_latent_handler.torch_latent = denoised_xt_model_fmt.permute(1,0,2,3).unsqueeze(0)
+                    if final_denoised_handler is not None and hasattr(step_output, 'pred_original_sample'):
+                        pred_x0 = step_output.pred_original_sample
+                        if pred_x0 is not None:
+                           final_denoised_handler.torch_latent = pred_x0.permute(1,0,2,3).unsqueeze(0)
+
 
                 else:
                     model_input_x_list = [latent_xt] 
@@ -628,7 +945,10 @@ class WanI2V:
                     
                     noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
                     
-                    latent_xt = sample_scheduler.step(noise_pred, t_val, latent_xt, return_dict=False, generator=seed_g)[0]
+                    step_output = sample_scheduler.step(noise_pred, t_val, latent_xt, return_dict=True, generator=seed_g)
+                    latent_xt = step_output.prev_sample
+                    if hasattr(step_output, 'pred_original_sample'):
+                        denoised_x0 = step_output.pred_original_sample
 
             if offload_model:
                 self.model.cpu()
@@ -636,21 +956,26 @@ class WanI2V:
 
             if self.rank == 0:
                 if enable_tiling:
-                    final_denoised_latent_model_fmt = ring_latent_handler.torch_latent.squeeze(0).permute(1,0,2,3)
+                    # If dpm++ was used and handler is populated, use it for higher quality output.
+                    if final_denoised_handler is not None and torch.any(final_denoised_handler.torch_latent != 0):
+                        output_latent = final_denoised_handler.torch_latent
+                    else:
+                        output_latent = ring_latent_handler.torch_latent # Fallback for unipc
+                    final_denoised_latent_model_fmt = output_latent.squeeze(0).permute(1,0,2,3)
                     videos = self.vae.decode([final_denoised_latent_model_fmt])
                 else:
-                    videos = self.vae.decode([latent_xt])
+                    videos = self.vae.decode([denoised_x0 if denoised_x0 is not None else latent_xt])
 
-        del noise, y_condition, context, context_null, clip_context, sample_scheduler
-        if enable_tiling:
-            del ring_latent_handler, ring_y_condition_handler, aggregated_noise_pred_handler, noise_contribution_counts
-        else:
-            del latent_xt
+            del noise, y_condition, context, context_null, clip_context, sample_scheduler
+            if enable_tiling:
+                del ring_latent_handler, ring_y_condition_handler, aggregated_noise_pred_handler, noise_contribution_counts, final_denoised_handler
+            else:
+                del latent_xt
             
-        if offload_model:
-            gc.collect()
-            torch.cuda.synchronize()
-        if dist.is_initialized():
-            dist.barrier()
+            if offload_model:
+                gc.collect()
+                torch.cuda.synchronize()
+            if dist.is_initialized():
+                dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+            return (videos[0], low_res_video_to_return) if self.rank == 0 else (None, None)
