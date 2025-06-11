@@ -62,9 +62,10 @@ def _validate_args(args):
     args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
         0, sys.maxsize)
     # Size check
-    assert args.size in SUPPORTED_SIZES[
-        args.
-        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+    if not args.tile_resolution:
+        assert args.size in SUPPORTED_SIZES[
+            args.
+            task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
 
 
 def _parse_args():
@@ -81,7 +82,6 @@ def _parse_args():
         "--size",
         type=str,
         default="1280*720",
-        choices=list(SIZE_CONFIGS.keys()),
         help="The area (width*height) of the generated video. For the I2V task, the aspect ratio of the output video will follow that of the input image."
     )
     parser.add_argument(
@@ -196,6 +196,11 @@ def _parse_args():
         action="store_true",
         default=False,
         help="Whether the generation is for a 360-degree panoramic video.")
+    parser.add_argument(
+        "--tile_resolution",
+        type=str,
+        default=None,
+        help="The resolution of each tile in `WxH` format (e.g., '832x480'). Overrides tile window factors.")
 
     args = parser.parse_args()
 
@@ -377,10 +382,20 @@ def generate(args):
         )
 
         logging.info("Generating video ...")
+
+        if args.tile_resolution:
+            try:
+                w, h = map(int, args.size.split('*'))
+                max_area = w * h
+            except ValueError:
+                raise ValueError(f"Invalid size format: {args.size}. Expected 'W*H'.")
+        else:
+            max_area = MAX_AREA_CONFIGS[args.size]
+
         video, low_res_video = wan_i2v.generate(
             args.prompt,
             img,
-            max_area=MAX_AREA_CONFIGS[args.size],
+            max_area=max_area,
             frame_num=args.frame_num,
             shift=args.sample_shift,
             sample_solver=args.sample_solver,
@@ -389,7 +404,8 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             use_coarse_to_fine=args.use_coarse_to_fine,
-            is_panorama=args.is_panorama)
+            is_panorama=args.is_panorama,
+            tile_resolution=args.tile_resolution)
 
     if rank == 0:
         if args.save_file is None:

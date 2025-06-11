@@ -467,8 +467,10 @@ class WanI2V:
                  tile_stride_factor: float = 0.25,
                  use_coarse_to_fine: bool = True,
                  coarse_max_area_factor: float = 0.25,
+                 coarse_sampling_steps: int = 10,
                  guidance_scale_schedule: tuple = (0.7, 0.2),
                  is_panorama: bool = False,
+                 tile_resolution: str | None = None,
                 ):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -506,15 +508,19 @@ class WanI2V:
             tile_stride_factor (`float`, *optional*, defaults to 0.25):
                 Stride for sliding window as a factor of the tile window dimension.
                 A lower value means more overlap and more tiles.
-            use_coarse_to_fine (`bool`, *optional*, defaults to False):
+            use_coarse_to_fine (`bool`, *optional*, defaults to True):
                 Enable two-stage generation where a low-res video guides a high-res one.
             coarse_max_area_factor (`float`, *optional*, defaults to 0.25):
-                The factor to reduce `max_area` by for the initial coarse video generation.
+                The factor to reduce `max_area` by for the initial coarse video generation. This is ignored if the coarse video is generated at a fixed 480p.
+            coarse_sampling_steps (`int`, *optional*, defaults to 10):
+                Number of sampling steps for the coarse video generation.
             guidance_scale_schedule (`tuple`, *optional*, defaults to (0.7, 0.2)):
                 The schedule for mixing the guidance latent. `(start_mix_factor, end_mix_factor)`.
                 A higher value means more of the guidance latent is mixed in.
             is_panorama (`bool`, *optional*, defaults to False):
                 Whether the generation is for a 360-degree panoramic video. Affects tiling logic.
+            tile_resolution (`str`, *optional*, defaults to None):
+                The resolution of each tile in `WxH` format (e.g., "832x480"). Overrides tile window factors.
 
         Returns:
             torch.Tensor:
@@ -528,14 +534,17 @@ class WanI2V:
         if use_coarse_to_fine:
             print("--- Coarse-to-Fine Generation Stage 1: Generating low-resolution video ---")
             
+            # Use a fixed 480p equivalent area for the coarse pass, as it's a native resolution
+            low_res_max_area = 480 * 832 
+
             low_res_video = self._generate_coarse_video(
                 input_prompt=input_prompt,
                 img=img,
-                max_area=int(max_area * coarse_max_area_factor),
+                max_area=low_res_max_area,
                 frame_num=frame_num,
                 shift=shift / 2.0,
                 sample_solver=sample_solver,
-                sampling_steps=sampling_steps,
+                sampling_steps=coarse_sampling_steps,
                 guide_scale=guide_scale,
                 n_prompt=n_prompt,
                 seed=seed,
@@ -716,15 +725,21 @@ class WanI2V:
 
                 patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
 
-                window_h_tile = max(int(lat_h * tile_window_height_factor), patch_h_model)
-                window_w_tile = max(int(lat_w * tile_window_width_factor), patch_w_model)
+                if tile_resolution:
+                    try:
+                        tile_w, tile_h = map(int, tile_resolution.split('x'))
+                        window_h_tile = (tile_h // self.vae_stride[1] // patch_h_model) * patch_h_model
+                        window_w_tile = (tile_w // self.vae_stride[2] // patch_w_model) * patch_w_model
+                    except ValueError:
+                        raise ValueError(f"Invalid tile_resolution format: {tile_resolution}. Expected 'WxH'.")
+                else:
+                    window_h_tile = max(int(lat_h * tile_window_height_factor), patch_h_model)
+                    window_w_tile = max(int(lat_w * tile_window_width_factor), patch_w_model)
+                
                 window_h_tile = (window_h_tile // patch_h_model) * patch_h_model
                 window_w_tile = (window_w_tile // patch_w_model) * patch_w_model
                 window_h_tile = max(window_h_tile, patch_h_model)
                 window_w_tile = max(window_w_tile, patch_w_model)
-
-                num_windows_h = math.ceil(lat_h / window_h_tile)
-                num_windows_w = math.ceil(lat_w / window_w_tile)
 
                 stride_h_tile = (max(1, int(window_h_tile * tile_stride_factor)) // patch_h_model) * patch_h_model
                 stride_w_tile = (max(1, int(window_w_tile * tile_stride_factor)) // patch_w_model) * patch_w_model
