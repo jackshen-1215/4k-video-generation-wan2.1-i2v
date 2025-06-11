@@ -409,11 +409,29 @@ def generate(args):
 
     if rank == 0:
         if args.save_file is None:
+            output_dir = "outputs"
             formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
+            formatted_prompt = args.prompt.replace(" ", "_").replace("/", "_")[:50]
+            
+            run_dir_name = f"{formatted_time}_{formatted_prompt}"
+            run_dir_path = os.path.join(output_dir, run_dir_name)
+            os.makedirs(run_dir_path, exist_ok=True)
+            
             suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
+            args.save_file = os.path.join(run_dir_path, f"video{suffix}")
+            log_file = os.path.join(run_dir_path, "generation.log")
+        else:
+            output_dir = os.path.dirname(args.save_file)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            base, _ = os.path.splitext(args.save_file)
+            log_file = f"{base}.log"
+
+        file_handler = logging.FileHandler(log_file)
+        formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s")
+        file_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(file_handler)
+        logging.info(f"Logging to file: {log_file}")
 
         if "t2i" in args.task:
             logging.info(f"Saving generated image to {args.save_file}")
