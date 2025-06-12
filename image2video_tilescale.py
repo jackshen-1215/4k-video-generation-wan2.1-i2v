@@ -449,6 +449,60 @@ class WanI2V:
         
         return videos[0] if self.rank == 0 else None
 
+    def _decode_tiled(self, latent_tensor, tile_resolution_str="832x480"):
+        # Parse tile resolution
+        tile_w_pixels, tile_h_pixels = map(int, tile_resolution_str.split('x'))
+        
+        # Convert pixel tile size to latent tile size
+        patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
+        tile_h_lat = (tile_h_pixels // self.vae_stride[1] // patch_h_model) * patch_h_model
+        tile_w_lat = (tile_w_pixels // self.vae_stride[2] // patch_w_model) * patch_w_model
+        
+        # Get full latent dimensions
+        full_h_lat, full_w_lat = latent_tensor.shape[-2:]
+        
+        # Create a buffer for the full output video
+        full_h_pixels = full_h_lat * self.vae_stride[1]
+        full_w_pixels = full_w_lat * self.vae_stride[2]
+        num_frames = latent_tensor.shape[1]
+        output_video = torch.zeros(
+            3, # RGB channels
+            num_frames, 
+            full_h_pixels, 
+            full_w_pixels, 
+            device=self.device,
+            dtype=self.param_dtype
+        )
+        
+        # Loop through tiles
+        for h_start in range(0, full_h_lat, tile_h_lat):
+            for w_start in range(0, full_w_lat, tile_w_lat):
+                h_end = min(h_start + tile_h_lat, full_h_lat)
+                w_end = min(w_start + tile_w_lat, full_w_lat)
+                
+                logging.info(f"Decoding tile at latent coordinates H:{h_start}-{h_end}, W:{w_start}-{w_end}")
+                
+                # Extract the latent tile
+                latent_tile = latent_tensor[:, :, h_start:h_end, w_start:w_end]
+                
+                # VAE expects a list of tensors
+                decoded_tile_list = self.vae.decode([latent_tile])
+                if not decoded_tile_list:
+                    continue
+                
+                decoded_tile = decoded_tile_list[0]
+                
+                # Place the decoded tile into the full output buffer
+                h_start_pixels = h_start * self.vae_stride[1]
+                w_start_pixels = w_start * self.vae_stride[2]
+                
+                # Get the actual shape of the decoded tile to handle edge cases
+                _, _, h_decoded, w_decoded = decoded_tile.shape
+                
+                output_video[:, :, h_start_pixels:h_start_pixels+h_decoded, w_start_pixels:w_start_pixels+w_decoded] = decoded_tile
+        
+        return [output_video]
+
     def generate(self,
                  input_prompt,
                  img,
@@ -468,7 +522,7 @@ class WanI2V:
                  use_coarse_to_fine: bool = True,
                  coarse_max_area_factor: float = 0.25,
                  coarse_sampling_steps: int = 10,
-                 guidance_scale_schedule: tuple = (0.7, 0.2),
+                 guidance_scale_schedule: tuple = (0.01, 0.01),
                  is_panorama: bool = False,
                  tile_resolution: str | None = None,
                 ):
@@ -508,15 +562,14 @@ class WanI2V:
             tile_stride_factor (`float`, *optional*, defaults to 0.25):
                 Stride for sliding window as a factor of the tile window dimension.
                 A lower value means more overlap and more tiles.
-            use_coarse_to_fine (`bool`, *optional*, defaults to True):
+            use_coarse_to_fine (`bool`, *optional*, defaults to False):
                 Enable two-stage generation where a low-res video guides a high-res one.
             coarse_max_area_factor (`float`, *optional*, defaults to 0.25):
                 The factor to reduce `max_area` by for the initial coarse video generation. This is ignored if the coarse video is generated at a fixed 480p.
             coarse_sampling_steps (`int`, *optional*, defaults to 10):
                 Number of sampling steps for the coarse video generation.
-            guidance_scale_schedule (`tuple`, *optional*, defaults to (0.7, 0.2)):
-                The schedule for mixing the guidance latent. `(start_mix_factor, end_mix_factor)`.
-                A higher value means more of the guidance latent is mixed in.
+            guidance_scale_schedule (`tuple`, *optional*, defaults to (0.0, 0.3)):
+                The schedule for mixing the guidance latent. A good starting point is a gentle schedule like `(0.0, 0.3)`, which ramps up the guidance.
             is_panorama (`bool`, *optional*, defaults to False):
                 Whether the generation is for a 360-degree panoramic video. Affects tiling logic.
             tile_resolution (`str`, *optional*, defaults to None):
@@ -915,6 +968,12 @@ class WanI2V:
                     
                     current_full_latents_xt_model_fmt = current_full_latents_xt_ring.squeeze(0).permute(1,0,2,3)
 
+                    # Manually predict the clean x0 based on the averaged noise prediction.
+                    # This is the most reliable way to get the clean output, regardless of solver.
+                    pred_x0 = current_full_latents_xt_model_fmt - sigma * avg_full_noise_pred_model_fmt
+                    if final_denoised_handler is not None:
+                        final_denoised_handler.torch_latent = pred_x0.permute(1,0,2,3).unsqueeze(0)
+
                     # Perform the solver step on the full latent
                     step_output = sample_scheduler.step(
                         avg_full_noise_pred_model_fmt,
@@ -926,10 +985,12 @@ class WanI2V:
                     denoised_xt_model_fmt = step_output.prev_sample
                     
                     ring_latent_handler.torch_latent = denoised_xt_model_fmt.permute(1,0,2,3).unsqueeze(0)
+                    
+                    # If the scheduler provides its own x0 prediction, prefer it (e.g., for dpm++)
                     if final_denoised_handler is not None and hasattr(step_output, 'pred_original_sample'):
-                        pred_x0 = step_output.pred_original_sample
-                        if pred_x0 is not None:
-                           final_denoised_handler.torch_latent = pred_x0.permute(1,0,2,3).unsqueeze(0)
+                        pred_x0_solver = step_output.pred_original_sample
+                        if pred_x0_solver is not None:
+                           final_denoised_handler.torch_latent = pred_x0_solver.permute(1,0,2,3).unsqueeze(0)
 
 
                 else:
@@ -971,13 +1032,15 @@ class WanI2V:
 
             if self.rank == 0:
                 if enable_tiling:
-                    # If dpm++ was used and handler is populated, use it for higher quality output.
-                    if final_denoised_handler is not None and torch.any(final_denoised_handler.torch_latent != 0):
-                        output_latent = final_denoised_handler.torch_latent
-                    else:
-                        output_latent = ring_latent_handler.torch_latent # Fallback for unipc
+                    # The final_denoised_handler now holds the clean x0 predictions from the *last* step
+                    output_latent = final_denoised_handler.torch_latent
                     final_denoised_latent_model_fmt = output_latent.squeeze(0).permute(1,0,2,3)
-                    videos = self.vae.decode([final_denoised_latent_model_fmt])
+                    
+                    if tile_resolution:
+                        logging.info("Using tiled VAE decoding for high-resolution output.")
+                        videos = self._decode_tiled(final_denoised_latent_model_fmt, tile_resolution)
+                    else:
+                        videos = self.vae.decode([final_denoised_latent_model_fmt])
                 else:
                     videos = self.vae.decode([denoised_x0 if denoised_x0 is not None else latent_xt])
 
