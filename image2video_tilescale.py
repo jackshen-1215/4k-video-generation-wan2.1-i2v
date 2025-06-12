@@ -464,10 +464,12 @@ class WanI2V:
         # Create a buffer for the full output video
         full_h_pixels = full_h_lat * self.vae_stride[1]
         full_w_pixels = full_w_lat * self.vae_stride[2]
-        num_frames = latent_tensor.shape[1]
+        # Calculate video frames from latent frames using temporal stride
+        latent_frames = latent_tensor.shape[1]
+        video_frames = (latent_frames - 1) * self.vae_stride[0] + 1
         output_video = torch.zeros(
             3, # RGB channels
-            num_frames, 
+            video_frames, 
             full_h_pixels, 
             full_w_pixels, 
             device=self.device,
