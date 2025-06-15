@@ -586,6 +586,19 @@ class WanI2V:
                 - W: Frame width from max_area)
         """
         low_res_video_to_return = None
+
+        # Use a predefined schedule for latent mixing, padded to 40 steps.
+        merge_predenoise_ratio_list = [
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.025, 0.05, 0.075, 0.01, 0.125, 
+            0.15, 0.175, 0.2, 0.225, 0.25, 
+            0.275, 0.3, 0.325, 0.35, 0.375, 
+            0.4, 0.425, 0.45, 0.475, 0.5,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0,
+        ]
+
         if use_coarse_to_fine:
             print("--- Coarse-to-Fine Generation Stage 1: Generating low-resolution video ---")
             
@@ -823,11 +836,13 @@ class WanI2V:
                         # Fallback or error for other solvers if they are added in the future
                         raise NotImplementedError(f"Sigma calculation for solver {sample_solver} is not implemented.")
 
+                    # progress = i_step / len(timesteps)
+                    # start_mix, end_mix = guidance_scale_schedule
+                    # # Linearly interpolate the mixing factor
+                    # mix_factor = start_mix + (end_mix - start_mix) * progress
+
                     # Implement latent mixing guidance
-                    progress = i_step / len(timesteps)
-                    start_mix, end_mix = guidance_scale_schedule
-                    # Linearly interpolate the mixing factor
-                    mix_factor = start_mix + (end_mix - start_mix) * progress
+                    mix_factor = merge_predenoise_ratio_list[i_step]
 
                     if not enable_tiling:
                         current_latent_target = latent_xt
