@@ -192,15 +192,20 @@ def _parse_args():
         default=True,
         help="Enable two-stage generation where a low-res video guides a high-res one.")
     parser.add_argument(
+        "--enable_tiling",
+        action="store_true",
+        default=False,
+        help="Enable tiling for processing large-resolution images.")
+    parser.add_argument(
         "--is_panorama",
         action="store_true",
         default=False,
-        help="Whether the generation is for a 360-degree panoramic video.")
+        help="Process the image as a panorama, connecting the left and right edges.")
     parser.add_argument(
         "--tile_resolution",
         type=str,
         default=None,
-        help="The resolution of each tile in `WxH` format (e.g., '832x480'). Overrides tile window factors.")
+        help="Resolution of each tile in 'width x height' format.")
 
     args = parser.parse_args()
 
@@ -383,14 +388,7 @@ def generate(args):
 
         logging.info("Generating video ...")
 
-        if args.tile_resolution:
-            try:
-                w, h = map(int, args.size.split('*'))
-                max_area = w * h
-            except ValueError:
-                raise ValueError(f"Invalid size format: {args.size}. Expected 'W*H'.")
-        else:
-            max_area = MAX_AREA_CONFIGS[args.size]
+        max_area = MAX_AREA_CONFIGS[args.size]
 
         video, low_res_video = wan_i2v.generate(
             args.prompt,
@@ -404,6 +402,7 @@ def generate(args):
             seed=args.base_seed,
             offload_model=args.offload_model,
             use_coarse_to_fine=args.use_coarse_to_fine,
+            enable_tiling=args.enable_tiling,
             is_panorama=args.is_panorama,
             tile_resolution=args.tile_resolution)
 

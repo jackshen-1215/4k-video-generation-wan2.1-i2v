@@ -273,7 +273,7 @@ class WanI2V:
                  frame_num=81,
                  shift=5.0,
                  sample_solver='unipc',
-                 sampling_steps=40,
+                 sampling_steps=10,
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
@@ -449,6 +449,22 @@ class WanI2V:
         
         return videos[0] if self.rank == 0 else None
 
+    def re_noise(self, x_start, noise, step_a, step_b, scheduler):
+        timestep_a = scheduler.timesteps[step_a]
+        timestep_b = scheduler.timesteps[step_b]
+
+        alpha_cumprod = scheduler.alphas_cumprod.to(x_start.device)
+
+        alpha_cumprod_a = alpha_cumprod[timestep_a]
+        alpha_cumprod_b = alpha_cumprod[timestep_b]
+
+        c = torch.sqrt(alpha_cumprod_b / alpha_cumprod_a)
+        s = torch.sqrt(1 - alpha_cumprod_b / alpha_cumprod_a)
+
+        x_b = c * x_start + s * noise
+
+        return x_b
+    
     def _decode_tiled(self, latent_tensor, tile_resolution_str="832x480"):
         # Parse tile resolution
         tile_w_pixels, tile_h_pixels = map(int, tile_resolution_str.split('x'))
@@ -587,30 +603,17 @@ class WanI2V:
         """
         low_res_video_to_return = None
 
-        # Use a predefined schedule for latent mixing, padded to 40 steps.
-        merge_predenoise_ratio_list = [
-            0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0,
-            0.025, 0.05, 0.075, 0.01, 0.125, 
-            0.15, 0.175, 0.2, 0.225, 0.25, 
-            0.275, 0.3, 0.325, 0.35, 0.375, 
-            0.4, 0.425, 0.45, 0.475, 0.5,
-            0.0, 0.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0, 0.0,
-        ]
+
 
         if use_coarse_to_fine:
             print("--- Coarse-to-Fine Generation Stage 1: Generating low-resolution video ---")
-            
-            # Use a fixed 480p equivalent area for the coarse pass, as it's a native resolution
-            low_res_max_area = 480 * 832 
-
+            low_res_max_area = int(max_area * coarse_max_area_factor)
             low_res_video = self._generate_coarse_video(
                 input_prompt=input_prompt,
                 img=img,
                 max_area=low_res_max_area,
                 frame_num=frame_num,
-                shift=shift / 2.0,
+                shift=shift,
                 sample_solver=sample_solver,
                 sampling_steps=coarse_sampling_steps,
                 guide_scale=guide_scale,
@@ -619,9 +622,8 @@ class WanI2V:
                 offload_model=offload_model
             )
             low_res_video_to_return = low_res_video
-            
-            print("--- Coarse-to-Fine Generation Stage 2: Preparing for high-resolution generation ---")
 
+            print("--- Coarse-to-Fine Generation Stage 2: Preparing for high-resolution generation ---")
             h_img_for_size, w_img_for_size = TF.to_tensor(img).shape[1:]
             aspect_ratio_for_size = h_img_for_size / w_img_for_size
             lat_h_hr = round(
@@ -632,24 +634,17 @@ class WanI2V:
                 self.patch_size[2] * self.patch_size[2])
 
             print(f"Encoding and upscaling low-resolution video latent to {lat_h_hr}x{lat_w_hr} for guidance...")
-            
-            # VAE expects a list of videos, where each is [C, F, H, W].
             low_res_latent_list = self.vae.encode([low_res_video.to(self.device)])
             if low_res_latent_list:
-                 low_res_latent = low_res_latent_list[0]
-                 
-                 # Reshape for bicubic interpolation, which works spatially.
-                 # (C, F, H, W) -> (F, C, H, W)
-                 low_res_latent_f_batch = low_res_latent.permute(1, 0, 2, 3)
-                 
-                 # Upscale the latent to the high-resolution target dimensions.
-                 guidance_latent_hr_f_batch = torch.nn.functional.interpolate(
-                     low_res_latent_f_batch,
-                     size=(lat_h_hr, lat_w_hr),
-                     mode='bicubic',
-                     align_corners=False
-                 )
-                 guidance_latent_hr = guidance_latent_hr_f_batch.permute(1, 0, 2, 3) # (C, F, H_hr, W_hr)
+                low_res_latent = low_res_latent_list[0]
+                low_res_latent_f_batch = low_res_latent.permute(1, 0, 2, 3)
+                guidance_latent_hr_f_batch = torch.nn.functional.interpolate(
+                    low_res_latent_f_batch,
+                    size=(lat_h_hr, lat_w_hr),
+                    mode='bicubic',
+                    align_corners=False
+                )
+                guidance_latent_hr = guidance_latent_hr_f_batch.permute(1, 0, 2, 3)
             else:
                 guidance_latent_hr = None
         else:
@@ -732,18 +727,6 @@ class WanI2V:
         clip_context = self.clip.visual([img_tensor_for_clip_vae[:, None, :, :]])
         if offload_model: self.clip.model.cpu()
 
-        # Determine k_text_fg_indices and k_text_bg_indices (once per prompt)
-        # For now, let's assume all text tokens from 'context' are foreground
-        # and no specific background text tokens for tile background patches to attend to.
-        k_text_fg_indices = None
-        k_text_bg_indices = None
-        if context is not None and len(context) > 0 and context[0] is not None:
-            # Assuming context is a list, and each element is [1, seq_len, dim] or similar
-            # Taking seq_len from the first item in the list (e.g., text embedding)
-            text_seq_len = context[0].shape[1]
-            k_text_fg_indices = torch.arange(text_seq_len, device=self.device, dtype=torch.long)
-            k_text_bg_indices = torch.empty(0, device=self.device, dtype=torch.long) # No specific background text tokens
-
         # The y_condition should always be based on the initial input image to provide a consistent
         # starting point for style, even when using coarse-to-fine guidance for motion.
         vae_input_img_part = torch.nn.functional.interpolate(
@@ -781,292 +764,122 @@ class WanI2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
-            if enable_tiling:
-                latent_xt_for_ring = noise.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                ring_latent_handler = RingLatent2D(latent_xt_for_ring, wrap=is_panorama)
-
-                y_condition_for_ring = y_condition.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)
-                ring_y_condition_handler = RingLatent2D(y_condition_for_ring, wrap=is_panorama)
-                
-                aggregated_noise_pred_handler = RingLatent2D(torch.zeros_like(latent_xt_for_ring, device=self.device), wrap=is_panorama)
-                noise_contribution_counts = RingLatent2D(torch.zeros_like(latent_xt_for_ring, dtype=torch.int, device=self.device), wrap=is_panorama)
-
-                patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
-
-                if tile_resolution:
-                    try:
-                        tile_w, tile_h = map(int, tile_resolution.split('x'))
-                        window_h_tile = (tile_h // self.vae_stride[1] // patch_h_model) * patch_h_model
-                        window_w_tile = (tile_w // self.vae_stride[2] // patch_w_model) * patch_w_model
-                    except ValueError:
-                        raise ValueError(f"Invalid tile_resolution format: {tile_resolution}. Expected 'WxH'.")
-                else:
-                    window_h_tile = max(int(lat_h * tile_window_height_factor), patch_h_model)
-                    window_w_tile = max(int(lat_w * tile_window_width_factor), patch_w_model)
-                
-                window_h_tile = (window_h_tile // patch_h_model) * patch_h_model
-                window_w_tile = (window_w_tile // patch_w_model) * patch_w_model
-                window_h_tile = max(window_h_tile, patch_h_model)
-                window_w_tile = max(window_w_tile, patch_w_model)
-
-                stride_h_tile = (max(1, int(window_h_tile * tile_stride_factor)) // patch_h_model) * patch_h_model
-                stride_w_tile = (max(1, int(window_w_tile * tile_stride_factor)) // patch_w_model) * patch_w_model
-                
-                num_offset_steps = max(1, int(1 / tile_stride_factor))
-            
+            if use_coarse_to_fine and guidance_latent_hr is not None:
+                timesteps = sample_scheduler.timesteps
+                # timesteps = sample_scheduler.timesteps[coarse_sampling_steps:]
+                noise = torch.randn_like(guidance_latent_hr)
+                # Get the noise at the specific timestep
+                # latent_xt = sample_scheduler.add_noise(guidance_latent_hr, noise, timesteps[0])
+                K = len(timesteps)
+                step_a = 0
+                step_b = K - coarse_sampling_steps
+                latent_xt = self.re_noise(guidance_latent_hr, noise, step_a, step_b, sample_scheduler)
             else:
-                latent_xt = noise.to(self.device) 
-                denoised_x0 = None
+                latent_xt = noise.to(self.device)
+                timesteps = sample_scheduler.timesteps
 
-            final_denoised_handler = RingLatent2D(torch.zeros_like(noise.permute(1, 0, 2, 3).unsqueeze(0).to(self.device)), wrap=is_panorama) if enable_tiling else None
+            denoised_x0 = None
 
             if offload_model: torch.cuda.empty_cache()
             self.model.to(self.device)
 
+            if enable_tiling:
+                # Tiling logic starts here
+                full_latent_h, full_latent_w = lat_h, lat_w
+                patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
+
+                if tile_resolution:
+                    tile_w_pixels, tile_h_pixels = map(int, tile_resolution.split('x'))
+                    tile_h_lat = (tile_h_pixels // self.vae_stride[1] // patch_h_model) * patch_h_model
+                    tile_w_lat = (tile_w_pixels // self.vae_stride[2] // patch_w_model) * patch_w_model
+                else:
+                    tile_h_lat = int(full_latent_h * tile_window_height_factor)
+                    tile_w_lat = int(full_latent_w * tile_window_width_factor)
+
+                stride_h = int(tile_h_lat * tile_stride_factor)
+                stride_w = int(tile_w_lat * tile_stride_factor)
+
+                latent_handler = RingLatent2D(latent_xt, wrap=is_panorama)
+                noise_pred_aggregator = torch.zeros_like(latent_xt, device=self.device)
+
             for i_step, t_val in enumerate(tqdm(timesteps)):
                 current_timestep_tensor = torch.tensor([t_val], device=self.device)
 
-                if use_coarse_to_fine and guidance_latent_hr is not None:
-                    if sample_solver == 'dpm++':
-                        sigma = t_val
-                    elif sample_solver == 'unipc':
-                        # For unipc, the i-th sigma in the schedule corresponds to the i-th timestep.
-                        sigma = sample_scheduler.sigmas[i_step]
-                    else:
-                        # Fallback or error for other solvers if they are added in the future
-                        raise NotImplementedError(f"Sigma calculation for solver {sample_solver} is not implemented.")
-
-                    # progress = i_step / len(timesteps)
-                    # start_mix, end_mix = guidance_scale_schedule
-                    # # Linearly interpolate the mixing factor
-                    # mix_factor = start_mix + (end_mix - start_mix) * progress
-
-                    # Implement latent mixing guidance
-                    mix_factor = merge_predenoise_ratio_list[i_step]
-
-                    if not enable_tiling:
-                        current_latent_target = latent_xt
-                    else:
-                        current_latent_target = ring_latent_handler.torch_latent.squeeze(0).permute(1,0,2,3)
-                    
-                    noise_for_guidance = torch.randn(guidance_latent_hr.shape, generator=seed_g, device=self.device, dtype=guidance_latent_hr.dtype)
-                    noised_guidance_latent = guidance_latent_hr + sigma * noise_for_guidance
-
-                    mixed_latent = torch.lerp(current_latent_target, noised_guidance_latent, mix_factor)
-
-                    if not enable_tiling:
-                        latent_xt = mixed_latent
-                    else:
-                        ring_latent_handler.torch_latent = mixed_latent.permute(1, 0, 2, 3).unsqueeze(0)
-
-
                 if enable_tiling:
-                    current_full_latents_xt_ring = ring_latent_handler.torch_latent.clone()
-                    
-                    offset_idx = i_step % num_offset_steps
-                    current_offset_h = offset_idx * (stride_h_tile // num_offset_steps) if num_offset_steps > 0 else 0
-                    current_offset_w = offset_idx * (stride_w_tile // num_offset_steps) if num_offset_steps > 0 else 0
+                    noise_pred_aggregator.zero_()
+                    num_tiles = 0
+                    for h_start in range(0, full_latent_h, stride_h):
+                        for w_start in range(0, full_latent_w, stride_w):
+                            h_end = min(h_start + tile_h_lat, full_latent_h)
+                            w_end = min(w_start + tile_w_lat, full_latent_w)
 
-                    for h_start_base in range(0, lat_h, stride_h_tile):
-                        for w_start_base in range(0, lat_w, stride_w_tile):
-                            tile_top = (h_start_base + current_offset_h)
-                            tile_bottom = tile_top + window_h_tile
-                            tile_left = (w_start_base + current_offset_w)
-                            tile_right = tile_left + window_w_tile
+                            tile_latent = latent_handler.get_window_latent(top=h_start, bottom=h_end, left=w_start, right=w_end)
 
-                            if not is_panorama:
-                                if tile_left >= lat_w or tile_top >= lat_h:
-                                    continue
+                            model_input_x_list = [tile_latent]
+                            model_input_y_list = [y_condition] # This needs to be tiled as well
 
-                            x_tile_ring_fmt = ring_latent_handler.get_window_latent(tile_top, tile_bottom, tile_left, tile_right)
-                            
-                            if x_tile_ring_fmt.shape[-2] == 0 or x_tile_ring_fmt.shape[-1] == 0: continue
-
-                            y_tile_ring_fmt = ring_y_condition_handler.get_window_latent(tile_top, tile_bottom, tile_left, tile_right)
-
-                            x_tile_model_input = [x_tile_ring_fmt.squeeze(0).permute(1,0,2,3)]
-                            y_tile_model_input = [y_tile_ring_fmt.squeeze(0).permute(1,0,2,3)]
-                            
-                            # Pad the input tile if its dimensions are not divisible by the patch size
-                            patch_h_model, patch_w_model = self.model.patch_size[1], self.model.patch_size[2]
-                            h_orig, w_orig = x_tile_model_input[0].shape[-2:]
-                            h_pad = (patch_h_model - h_orig % patch_h_model) % patch_h_model
-                            w_pad = (patch_w_model - w_orig % patch_w_model) % patch_w_model
-                            
-                            x_tile_for_model = x_tile_model_input[0]
-                            y_tile_for_model = y_tile_model_input[0]
-
-                            if h_pad > 0 or w_pad > 0:
-                                x_tile_for_model = torch.nn.functional.pad(x_tile_for_model, (0, w_pad, 0, h_pad), mode='replicate')
-                                y_tile_for_model = torch.nn.functional.pad(y_tile_for_model, (0, w_pad, 0, h_pad), mode='replicate')
-
-                            _tile_f, _tile_h, _tile_w = x_tile_for_model.shape[1], x_tile_for_model.shape[2], x_tile_for_model.shape[3]
-                            num_temporal_patches = _tile_f // self.model.patch_size[0]
-                            num_spatial_patches_h = _tile_h // self.model.patch_size[1]
-                            num_spatial_patches_w = _tile_w // self.model.patch_size[2]
-                            
-                            # Create q_tile_spatial_fg_mask for the current tile
-                            # Defines foreground region within the tile.
-                            # Set all patches to foreground for this approach.
-                            q_tile_spatial_fg_mask = torch.ones(num_spatial_patches_h, num_spatial_patches_w, dtype=torch.bool, device=self.device)
-                            q_tile_spatial_fg_mask = q_tile_spatial_fg_mask.flatten() # Shape: (num_spatial_patches_h * num_spatial_patches_w)
-
-                            tile_seq_len = num_temporal_patches * num_spatial_patches_h * num_spatial_patches_w
-                            tile_seq_len = int(math.ceil(tile_seq_len / self.sp_size)) * self.sp_size
-                            
                             model_kwargs_tile = {
-                                'context': context, 
-                                'clip_fea': clip_context, 
-                                'seq_len': tile_seq_len, 
-                                'y': [y_tile_for_model],
-                                'enable_tiling_mask': True,
-                                'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
-                                'k_text_fg_indices': k_text_fg_indices,
-                                'k_text_bg_indices': k_text_bg_indices,
+                                'context': context,
+                                'clip_fea': clip_context,
+                                'seq_len': full_max_seq_len, # This might need adjustment for tiles
+                                'y': model_input_y_list,
                             }
-                            
-                            noise_pred_cond_tile_padded = self.model([x_tile_for_model], t=current_timestep_tensor, **model_kwargs_tile)[0]
-                            if offload_model: torch.cuda.empty_cache()
+                            noise_pred_cond_tile = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_tile)[0]
 
-                            # For null condition, we might not need the nuanced mask, or pass None for text indices.
-                            # For simplicity, let's pass the same kwargs, assuming an advanced attention module
-                            # might internally handle None for fg/bg indices if context is null.
-                            # Or, ideally, the attention module checks if context is the null context and skips this masking.
                             model_kwargs_null_tile = {
-                                'context': context_null, 
-                                'clip_fea': clip_context, 
-                                'seq_len': tile_seq_len, 
-                                'y': [y_tile_for_model],
-                                'enable_tiling_mask': True, # Keep structure, actual masking might be skipped if context_null implies no text
-                                'q_tile_spatial_fg_mask': q_tile_spatial_fg_mask,
-                                'k_text_fg_indices': k_text_fg_indices, # Or pass None if context_null means "no text"
-                                'k_text_bg_indices': k_text_bg_indices, # Or pass None
+                                'context': context_null,
+                                'clip_fea': clip_context,
+                                'seq_len': full_max_seq_len, # This might need adjustment for tiles
+                                'y': model_input_y_list,
                             }
-                            noise_pred_uncond_tile_padded = self.model([x_tile_for_model], t=current_timestep_tensor, **model_kwargs_null_tile)[0]
-                            if offload_model: torch.cuda.empty_cache()
-                            
-                            if h_pad > 0 or w_pad > 0:
-                                noise_pred_cond_tile = noise_pred_cond_tile_padded[..., :h_orig, :w_orig]
-                                noise_pred_uncond_tile = noise_pred_uncond_tile_padded[..., :h_orig, :w_orig]
-                            else:
-                                noise_pred_cond_tile = noise_pred_cond_tile_padded
-                                noise_pred_uncond_tile = noise_pred_uncond_tile_padded
-                            
-                            final_noise_pred_tile = noise_pred_uncond_tile + guide_scale * (noise_pred_cond_tile - noise_pred_uncond_tile)
-                            
-                            final_noise_pred_tile_ring_fmt = final_noise_pred_tile.permute(1,0,2,3).unsqueeze(0)
+                            noise_pred_uncond_tile = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_null_tile)[0]
 
-                            # Aggregate the noise predictions
-                            if is_panorama:
-                                h_slices_agg, h_sizes_agg = get_dimension_slices_and_sizes(tile_top, tile_bottom, lat_h, is_panorama)
-                                w_slices_agg, w_sizes_agg = get_dimension_slices_and_sizes(tile_left, tile_right, lat_w, is_panorama)
+                            noise_pred_tile = noise_pred_uncond_tile + guide_scale * (noise_pred_cond_tile - noise_pred_uncond_tile)
 
-                                h_offset_in_tile_pred = 0
-                                for h_slice, h_size in zip(h_slices_agg, h_sizes_agg):
-                                    w_offset_in_tile_pred = 0
-                                    for w_slice, w_size in zip(w_slices_agg, w_sizes_agg):
-                                        source_part = final_noise_pred_tile_ring_fmt[:, :, :, h_offset_in_tile_pred:h_offset_in_tile_pred + h_size, w_offset_in_tile_pred:w_offset_in_tile_pred + w_size]
-                                        aggregated_noise_pred_handler.torch_latent[:, :, :, h_slice, w_slice] += source_part
-                                        noise_contribution_counts.torch_latent[:, :, :, h_slice, w_slice] += 1
-                                        w_offset_in_tile_pred += w_size
-                                    h_offset_in_tile_pred += h_size
-                            else:
-                                # Simplified logic for non-panoramic videos
-                                h_slice = slice(max(0, tile_top), min(lat_h, tile_bottom))
-                                w_slice = slice(max(0, tile_left), min(lat_w, tile_right))
-                                aggregated_noise_pred_handler.torch_latent[:, :, :, h_slice, w_slice] += final_noise_pred_tile_ring_fmt
-                                noise_contribution_counts.torch_latent[:, :, :, h_slice, w_slice] += 1
-                    
-                    # Average the aggregated noise predictions
-                    valid_counts = noise_contribution_counts.torch_latent.float().clamp(min=1.0)
-                    avg_full_noise_pred_ring_fmt = aggregated_noise_pred_handler.torch_latent / valid_counts
-                    
-                    avg_full_noise_pred_model_fmt = avg_full_noise_pred_ring_fmt.squeeze(0).permute(1,0,2,3)
-                    
-                    current_full_latents_xt_model_fmt = current_full_latents_xt_ring.squeeze(0).permute(1,0,2,3)
+                            # Aggregate noise predictions
+                            noise_pred_aggregator[:, :, :, h_start:h_end, w_start:w_end] += noise_pred_tile
+                            num_tiles += 1
 
-                    # Manually predict the clean x0 based on the averaged noise prediction.
-                    # This is the most reliable way to get the clean output, regardless of solver.
-                    pred_x0 = current_full_latents_xt_model_fmt - sigma * avg_full_noise_pred_model_fmt
-                    if final_denoised_handler is not None:
-                        final_denoised_handler.torch_latent = pred_x0.permute(1,0,2,3).unsqueeze(0)
+                    noise_pred = noise_pred_aggregator / num_tiles
 
-                    # Perform the solver step on the full latent
-                    step_output = sample_scheduler.step(
-                        avg_full_noise_pred_model_fmt,
-                        t_val,
-                        current_full_latents_xt_model_fmt,
-                        return_dict=True,
-                        generator=seed_g 
-                    )
-                    denoised_xt_model_fmt = step_output.prev_sample
-                    
-                    ring_latent_handler.torch_latent = denoised_xt_model_fmt.permute(1,0,2,3).unsqueeze(0)
-                    
-                    # If the scheduler provides its own x0 prediction, prefer it (e.g., for dpm++)
-                    if final_denoised_handler is not None and hasattr(step_output, 'pred_original_sample'):
-                        pred_x0_solver = step_output.pred_original_sample
-                        if pred_x0_solver is not None:
-                           final_denoised_handler.torch_latent = pred_x0_solver.permute(1,0,2,3).unsqueeze(0)
-
-
-                else:
-                    model_input_x_list = [latent_xt] 
+                else: # Non-tiled generation
+                    model_input_x_list = [latent_xt]
                     model_input_y_list = [y_condition]
 
-                    # When not tiling, disable the tiling mask logic
                     model_kwargs_full = {
-                        'context': context, 
-                        'clip_fea': clip_context, 
-                        'seq_len': full_max_seq_len, 
+                        'context': context,
+                        'clip_fea': clip_context,
+                        'seq_len': full_max_seq_len,
                         'y': model_input_y_list,
-                        'enable_tiling_mask': False, # Explicitly False
-                        # The other mask-related params are not needed when enable_tiling_mask is False
                     }
                     noise_pred_cond = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_full)[0]
-                    if offload_model: torch.cuda.empty_cache()
 
                     model_kwargs_null_full = {
-                        'context': context_null, 
-                        'clip_fea': clip_context, 
-                        'seq_len': full_max_seq_len, 
+                        'context': context_null,
+                        'clip_fea': clip_context,
+                        'seq_len': full_max_seq_len,
                         'y': model_input_y_list,
-                        'enable_tiling_mask': False,
                     }
                     noise_pred_uncond = self.model(model_input_x_list, t=current_timestep_tensor, **model_kwargs_null_full)[0]
-                    if offload_model: torch.cuda.empty_cache()
-                    
                     noise_pred = noise_pred_uncond + guide_scale * (noise_pred_cond - noise_pred_uncond)
-                    
-                    step_output = sample_scheduler.step(noise_pred, t_val, latent_xt, return_dict=True, generator=seed_g)
-                    latent_xt = step_output.prev_sample
-                    if hasattr(step_output, 'pred_original_sample'):
-                        denoised_x0 = step_output.pred_original_sample
+
+                step_output = sample_scheduler.step(noise_pred, t_val, latent_xt, return_dict=True, generator=seed_g)
+                latent_xt = step_output.prev_sample
+                if hasattr(step_output, 'pred_original_sample'):
+                    denoised_x0 = step_output.pred_original_sample
 
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
             if self.rank == 0:
-                if enable_tiling:
-                    # The final_denoised_handler now holds the clean x0 predictions from the *last* step
-                    output_latent = final_denoised_handler.torch_latent
-                    final_denoised_latent_model_fmt = output_latent.squeeze(0).permute(1,0,2,3)
-                    
-                    if tile_resolution:
-                        logging.info("Using tiled VAE decoding for high-resolution output.")
-                        videos = self._decode_tiled(final_denoised_latent_model_fmt, tile_resolution)
-                    else:
-                        videos = self.vae.decode([final_denoised_latent_model_fmt])
+                if enable_tiling and tile_resolution:
+                    videos = self._decode_tiled(denoised_x0 if denoised_x0 is not None else latent_xt, tile_resolution)
                 else:
                     videos = self.vae.decode([denoised_x0 if denoised_x0 is not None else latent_xt])
 
-            del noise, y_condition, context, context_null, clip_context, sample_scheduler
-            if enable_tiling:
-                del ring_latent_handler, ring_y_condition_handler, aggregated_noise_pred_handler, noise_contribution_counts, final_denoised_handler
-            else:
-                del latent_xt
-            
+            del noise, y_condition, context, context_null, clip_context, sample_scheduler, latent_xt
+
             if offload_model:
                 gc.collect()
                 torch.cuda.synchronize()

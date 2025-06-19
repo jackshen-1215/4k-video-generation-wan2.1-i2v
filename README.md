@@ -15,27 +15,17 @@ cd Wan2.1
 
 Follow the official instructions in the Wan2.1 repository to install the required dependencies. Make sure you use the I2V-14B-720P or I2V-14B-480P model when generating videos.
 
-### 3. Move the Provided Pipeline
-
-Move the provided `image2video_tilescale.py` into the pipelines directory, replacing the existing file:
-
-```bash
-cd Wan2.1
-cp ./image2video_tilescale.py ./wan/image2video.py
-```
-
-### 4. Move the Provided Model, Attention, Generate Files
+### 3. Move the Provided Image2Video, Generate Files
 
 Move the provided files into the corresponding directory, replacing the existing file:
 
 ```bash
 cd Wan2.1
-cp ./model_tilescale.py ./wan/modules/model.py
-cp ./attention_tilescale.py ./wan/modules/attention.py
-cp ./generate_low-res-guide/py ./generate.py
+cp ../generate_low-res-guide/py ./generate.py
+cp ../image2video_tilescale.py ./wan/image2video.py
 ```
 
-### 5. Run the Video Generation
+### 4. Run the Video Generation
 
 Use the standard scripts for video generation as described in the official repository.  
 Ensure you specify the appropriate parameters for 4K output.
